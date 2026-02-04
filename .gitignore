@@ -2,6 +2,7 @@
 node_modules/
 .env
 .DS_Store
-*.log
+*.loggit add .gitignore
 dist/
 build/
+src/data/history.json

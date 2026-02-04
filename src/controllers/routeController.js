@@ -1,126 +1,78 @@
+
+const { geocodeAddress, isCoordinate } = require('../services/geocodingService');
+const { getWeather } = require('../services/weatherService');
+const { getJamRisk } = require('../services/trafficPredictionService');
+const { calculateRouteMetrics, sortRoutesByScore } = require('../services/routeOptimizationService');
 const axios = require('axios');
 
 const optimizeRoute = async (req, res) => {
-  const { start, end } = req.body;
+  let { start, end } = req.body;
 
   if (!start || !end) {
-    return res.status(400).json({ 
-      error: 'Cần cung cấp start và end (tọa độ dạng lat,lng hoặc địa chỉ)' 
-    });
+    return res.status(400).json({ error: 'Cần start và end' });
   }
 
   try {
-    // Gọi Google Maps Directions API
-    const response = await axios.get('https://maps.googleapis.com/maps/api/directions/json', {
+    // Geocoding
+    let startCoord = start;
+    let endCoord = end;
+    let startAddress = start;
+    let endAddress = end;
+
+    if (!isCoordinate(start)) startCoord = await geocodeAddress(start);
+    if (!isCoordinate(end)) endCoord = await geocodeAddress(end);
+
+    // Directions API
+    const directionsRes = await axios.get('https://maps.googleapis.com/maps/api/directions/json', {
       params: {
-        origin: start,
-        destination: end,
+        origin: startCoord,
+        destination: endCoord,
         key: process.env.GOOGLE_MAPS_API_KEY,
-        mode: 'driving',           // xe máy cũng dùng driving ở VN
+        mode: 'driving',
         alternatives: true,
         region: 'vn',
-        departure_time: 'now',     // dùng thời gian hiện tại để lấy traffic realtime
+        departure_time: 'now',
       },
     });
 
-    const data = response.data;
-
-    if (data.status !== 'OK') {
-      return res.status(400).json({ 
-        error: 'Google Maps trả về lỗi', 
-        googleStatus: data.status,
-        googleMessage: data.error_message || 'Không có thông tin chi tiết'
-      });
+    const data = directionsRes.data;
+    if (data.status !== 'OK' || !data.routes?.length) {
+      return res.status(400).json({ error: 'Không tìm thấy lộ trình', details: data });
     }
 
     const routes = data.routes;
 
-    if (!routes || routes.length === 0) {
-      return res.status(404).json({ error: 'Không tìm thấy lộ trình nào' });
-    }
+    // Thời tiết
+    const [lat, lon] = startCoord.split(',').map(Number);
+    const weather = await getWeather(lat, lon);
 
-    // Lấy thời gian hiện tại để dự đoán kẹt xe
-    const now = new Date();
-    const hour = now.getHours();
-    const dayOfWeek = now.getDay(); // 0 = CN, 1 = Thứ 2, ..., 6 = Thứ 7
+    // Jam risk
+    const jamRisk = getJamRisk(lat, lon, weather.impactPercentage);
 
-    // Quy tắc dự đoán kẹt xe (có thể cải tiến sau)
-    let jamRiskPercentage = 0;
+    // Xử lý routes
+    const processed = routes.map((route, index) => ({
+      ...calculateRouteMetrics(route, jamRisk),
+      routeIndex: index,
+    }));
 
-    // Giờ cao điểm TP.HCM/Hà Nội
-    if ((hour >= 7 && hour <= 9) || (hour >= 16 && hour <= 19)) {
-      jamRiskPercentage += 50; // tăng 50% thời gian
-    }
-
-    // Cuối tuần giảm rủi ro
-    if (dayOfWeek === 0 || dayOfWeek === 6) {
-      jamRiskPercentage -= 20;
-    }
-
-    // Giới hạn min/max
-    jamRiskPercentage = Math.max(0, Math.min(80, jamRiskPercentage));
-
-    // Xử lý các lộ trình
-    const processedRoutes = routes.map((route, index) => {
-      const leg = route.legs[0];
-
-      // Thời gian cơ bản từ Google (thường đã có traffic realtime)
-      const baseDurationText = leg.duration.text; // ví dụ: "25 mins"
-      const baseDurationMinutes = leg.duration.value / 60; // giây -> phút
-
-      // Dự đoán thời gian thực tế (thêm phần kẹt xe)
-      const extraTimeMinutes = baseDurationMinutes * (jamRiskPercentage / 100);
-      const predictedDurationMinutes = Math.round(baseDurationMinutes + extraTimeMinutes);
-      const predictedDurationText = `${predictedDurationMinutes} phút (dự đoán)`;
-
-      // Ước tính xăng (giả sử xe máy tiêu thụ 2.0 - 2.5 lít/100km)
-      const distanceKm = leg.distance.value / 1000;
-      const fuelConsumption = 2.2; // lít/100km (trung bình xe Wave/Sirius)
-      const fuelUsedLiters = (distanceKm * fuelConsumption) / 100;
-      const fuelUsedText = fuelUsedLiters.toFixed(2) + ' lít';
-
-      // Điểm số lộ trình (càng thấp càng tốt: thời gian + rủi ro kẹt)
-      const score = Math.round(predictedDurationMinutes + jamRiskPercentage * 0.5);
-
-      return {
-        routeIndex: index,
-        summary: route.summary || 'Lộ trình xe máy',
-        distance: leg.distance.text,
-        baseDuration: baseDurationText,
-        predictedDuration: predictedDurationText,
-        predictedDurationMinutes,
-        jamRisk: jamRiskPercentage + '%',
-        fuelUsed: fuelUsedText,
-        polyline: route.overview_polyline.points,
-        score: score, // dùng để sắp xếp lộ trình tốt nhất
-      };
-    });
-
-    // Sắp xếp lộ trình theo score thấp nhất (tốt nhất)
-    processedRoutes.sort((a, b) => a.score - b.score);
-
-    // Lộ trình tốt nhất
-    const bestRoute = processedRoutes[0];
+    const sorted = sortRoutesByScore(processed);
+    const best = sorted[0];
 
     res.json({
       success: true,
-      routes: processedRoutes,
-      bestRoute,
-      currentJamRisk: jamRiskPercentage + '%',
-      timestamp: now.toISOString(),
+      routes: sorted,
+      bestRoute: best,
+      currentJamRisk: `${jamRisk.toFixed(0)}%`,
+      weather,
+      startAddress,
+      endAddress,
+      startCoord,
+      endCoord,
+      timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error('Lỗi khi gọi Google Maps Directions API:');
-    console.error('Message:', error.message);
-    if (error.response) {
-      console.error('Google Response:', error.response.data);
-    }
-
-    res.status(500).json({
-      error: 'Lỗi server khi lấy lộ trình',
-      details: error.message,
-      googleError: error.response ? error.response.data : null,
-    });
+    console.error(error);
+    res.status(500).json({ error: 'Lỗi server', details: error.message });
   }
 };
 
